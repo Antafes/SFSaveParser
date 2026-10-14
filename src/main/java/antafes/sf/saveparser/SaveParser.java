@@ -37,6 +37,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.zip.DataFormatException;
 import java.util.zip.Inflater;
 
@@ -53,6 +54,12 @@ public class SaveParser implements SaveParserService
     private static final long CHUNK_COMPRESSION_METHOD = 0x03000000L;
     private static final long TICKS_PER_SECOND = 10_000_000L;
     private static final long EPOCH_1_TO_1970_SECONDS = 719_162L * 24 * 60 * 60;
+    private static final int ARRAY_INDEX_FLAG = 0x01;
+    private static final int PROPERTY_GUID_FLAG = 0x02;
+    private static final int PROPERTY_EXTENSIONS_FLAG = 0x04;
+    private static final Set<String> BINARY_STRUCT_TYPES = Set.of(
+        "LinearColor", "Vector2D", "Vector", "Quat", "DateTime", "Guid", "IntVector", "InventoryItem"
+    );
 
     /**
      * Reads only uncompressed metadata from a file.
@@ -420,6 +427,9 @@ public class SaveParser implements SaveParserService
             throw reader.error("Object content exceeds declared object size");
         }
         byte[] trailingData = reader.readBytes(objectSize - consumed);
+        if (propertyUnrealEngine5Version >= 1011) {
+            reader.expectUnsignedInt(0, "object trailer");
+        }
         return new SaveObject(header.instanceName(), gameVersion, migratesObjectReferences, versionData, parentReference, componentReferences, properties, trailingData);
     }
 
@@ -438,6 +448,8 @@ public class SaveParser implements SaveParserService
             String structType = null;
             String keyType = null;
             String valueType = null;
+            String keyStructType = null;
+            String valueStructType = null;
             if (modernHeader) {
                 long headerType = reader.readUnsignedInt();
                 metadata.add(headerType);
@@ -474,13 +486,15 @@ public class SaveParser implements SaveParserService
                     keyType = reader.readString();
                     metadata.add(keyType);
                     if (reader.readBoolean("map key type name flag")) {
-                        reader.expectString("IntVector", "map key type name");
+                        keyStructType = reader.readString();
+                        metadata.add(keyStructType);
                         metadata.add(this.readPackageNames(reader));
                     }
                     valueType = reader.readString();
                     metadata.add(valueType);
                     if (reader.readBoolean("map value type name flag")) {
-                        metadata.add(reader.readString());
+                        valueStructType = reader.readString();
+                        metadata.add(valueStructType);
                         metadata.add(this.readPackageNames(reader));
                     }
                 }
@@ -489,7 +503,7 @@ public class SaveParser implements SaveParserService
             if (!modernHeader) {
                 metadata.add(reader.readUnsignedInt());
             }
-            Object value = this.readPropertyValue(reader, type, name, size, modernHeader, metadata, arrayType, structType, keyType, valueType, entityVersion, unrealEngine5Version);
+            Object value = this.readPropertyValue(reader, type, name, size, modernHeader, metadata, arrayType, structType, keyType, valueType, keyStructType, valueStructType, entityVersion, unrealEngine5Version);
             properties.add(new SaveProperty(name, type, value, metadata));
         }
     }
@@ -505,6 +519,8 @@ public class SaveParser implements SaveParserService
         String structType,
         String keyType,
         String valueType,
+        String keyStructType,
+        String valueStructType,
         long entityVersion,
         long unrealEngine5Version
     )
@@ -534,10 +550,23 @@ public class SaveParser implements SaveParserService
                 metadata.add(valueType);
             }
         }
-        reader.expectUnsignedByte(0, "property guid flag");
+        int flags = reader.readUnsignedByte();
+        if (modernHeader) {
+            if ((flags & ARRAY_INDEX_FLAG) != 0) {
+                reader.readInt();
+            }
+            if ((flags & PROPERTY_GUID_FLAG) != 0) {
+                reader.skip(16);
+            }
+            if ((flags & PROPERTY_EXTENSIONS_FLAG) != 0) {
+                throw reader.error("Unsupported property extensions on property " + name);
+            }
+        } else if (flags != 0) {
+            throw reader.error("Expected property guid flag to be 0 but found " + flags);
+        }
         int valueStart = reader.offset();
         Object value = switch (type) {
-            case "ByteProperty" -> this.readByteProperty(reader, metadata);
+            case "ByteProperty" -> this.readByteProperty(reader, metadata, modernHeader);
             case "Int8Property" -> reader.readByte();
             case "IntProperty" -> reader.readInt();
             case "UInt32Property" -> reader.readUnsignedInt();
@@ -547,9 +576,9 @@ public class SaveParser implements SaveParserService
             case "EnumProperty", "StrProperty", "NameProperty" -> reader.readString();
             case "ObjectProperty" -> this.readReference(reader);
             case "SoftObjectProperty" -> List.of(this.readReference(reader), reader.readUnsignedInt());
-            case "ArrayProperty" -> this.readArray(reader, arrayType, structType, entityVersion, unrealEngine5Version);
+            case "ArrayProperty" -> this.readArray(reader, arrayType, structType, modernHeader, entityVersion, unrealEngine5Version);
             case "SetProperty" -> this.readSet(reader, arrayType);
-            case "MapProperty" -> this.readMap(reader, keyType, valueType, entityVersion, unrealEngine5Version);
+            case "MapProperty" -> this.readMap(reader, keyType, valueType, keyStructType, valueStructType, entityVersion, unrealEngine5Version);
             case "StructProperty" -> this.readStruct(reader, structType, size, entityVersion, unrealEngine5Version);
             default -> reader.readBytes(size);
         };
@@ -559,16 +588,28 @@ public class SaveParser implements SaveParserService
         return value;
     }
 
-    private Object readByteProperty(BinaryReader reader, List<Object> metadata)
+    private Object readByteProperty(BinaryReader reader, List<Object> metadata, boolean modernHeader)
     {
-        String enumName = metadata.isEmpty() ? null : String.valueOf(metadata.getLast());
+        Object enumValue = null;
+        if (modernHeader) {
+            enumValue = metadata.size() > 1 ? metadata.get(1) : null;
+        } else if (!metadata.isEmpty()) {
+            enumValue = metadata.getLast();
+        }
+        String enumName = enumValue instanceof String name ? name : null;
         return enumName == null || "None".equals(enumName) ? reader.readUnsignedByte() : reader.readString();
     }
 
-    private List<Object> readArray(BinaryReader reader, String arrayType, String structType, long entityVersion, long unrealEngine5Version)
+    private List<Object> readArray(BinaryReader reader, String arrayType, String structType, boolean modernHeader, long entityVersion, long unrealEngine5Version)
     {
-        reader.readUnsignedByte();
         int count = this.readCount(reader, "array element count");
+        if (!modernHeader && "StructProperty".equals(arrayType)) {
+            reader.readString();
+            reader.expectString("StructProperty", "array struct property type");
+            reader.readLong();
+            structType = reader.readString();
+            reader.skip(17);
+        }
         List<Object> values = new ArrayList<>(count);
         for (int index = 0; index < count; index++) {
             values.add(this.readCollectionValue(reader, arrayType, structType, entityVersion, unrealEngine5Version));
@@ -578,7 +619,6 @@ public class SaveParser implements SaveParserService
 
     private List<Object> readSet(BinaryReader reader, String elementType)
     {
-        reader.readUnsignedByte();
         reader.expectUnsignedInt(0, "set mode");
         int count = this.readCount(reader, "set element count");
         List<Object> values = new ArrayList<>(count);
@@ -593,15 +633,14 @@ public class SaveParser implements SaveParserService
         return values;
     }
 
-    private Map<Object, Object> readMap(BinaryReader reader, String keyType, String valueType, long entityVersion, long unrealEngine5Version)
+    private Map<Object, Object> readMap(BinaryReader reader, String keyType, String valueType, String keyStructType, String valueStructType, long entityVersion, long unrealEngine5Version)
     {
-        reader.readUnsignedByte();
         reader.expectUnsignedInt(0, "map mode");
         int count = this.readCount(reader, "map entry count");
         Map<Object, Object> values = new LinkedHashMap<>(count);
         for (int index = 0; index < count; index++) {
-            Object key = this.readCollectionValue(reader, keyType, null, entityVersion, unrealEngine5Version);
-            Object value = this.readCollectionValue(reader, valueType, null, entityVersion, unrealEngine5Version);
+            Object key = this.readCollectionValue(reader, keyType, keyStructType, entityVersion, unrealEngine5Version);
+            Object value = this.readCollectionValue(reader, valueType, valueStructType, entityVersion, unrealEngine5Version);
             values.put(key, value);
         }
         return values;
@@ -615,6 +654,8 @@ public class SaveParser implements SaveParserService
             case "Vector" -> List.of(reader.readDouble(), reader.readDouble(), reader.readDouble());
             case "Quat" -> List.of(reader.readDouble(), reader.readDouble(), reader.readDouble(), reader.readDouble());
             case "DateTime" -> reader.readLong();
+            case "Guid" -> List.of(reader.readLong(), reader.readLong());
+            case "IntVector" -> List.of(reader.readInt(), reader.readInt(), reader.readInt());
             case "InventoryItem" -> this.readInventoryItem(reader, entityVersion, unrealEngine5Version);
             default -> reader.readBytes(size);
         };
@@ -624,6 +665,9 @@ public class SaveParser implements SaveParserService
     {
         reader.expectUnsignedInt(0, "inventory item level");
         String itemName = reader.readString();
+        if (unrealEngine5Version < 1012) {
+            return List.of(itemName, this.readReference(reader));
+        }
         if (!reader.readBoolean("inventory item property flag")) {
             return List.of(itemName, List.of());
         }
@@ -650,7 +694,9 @@ public class SaveParser implements SaveParserService
             case "StrProperty", "NameProperty", "EnumProperty" -> reader.readString();
             case "ObjectProperty", "InterfaceProperty" -> this.readReference(reader);
             case "SoftObjectProperty" -> List.of(this.readReference(reader), reader.readUnsignedInt());
-            case "StructProperty" -> structType == null ? this.readProperties(reader, entityVersion, unrealEngine5Version) : this.readStruct(reader, structType, Integer.MAX_VALUE, entityVersion, unrealEngine5Version);
+            case "StructProperty" -> structType == null || !BINARY_STRUCT_TYPES.contains(structType)
+                ? this.readProperties(reader, entityVersion, unrealEngine5Version)
+                : this.readStruct(reader, structType, Integer.MAX_VALUE, entityVersion, unrealEngine5Version);
             default -> throw reader.error("Unsupported collection value type " + type);
         };
     }

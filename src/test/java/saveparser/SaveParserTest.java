@@ -34,9 +34,9 @@ class SaveParserTest
     private SaveParserService saveParser;
 
     @Test
-    void readsSuppliedSaveHeader() throws IOException, URISyntaxException
+    void readsSaveVersion36Header() throws IOException, URISyntaxException
     {
-        SaveFileInfo fileInfo = this.saveParser.readSaveFileInfo(this.fixturePath());
+        SaveFileInfo fileInfo = this.saveParser.readSaveFileInfo(this.fixturePath(36));
 
         assertEquals(10, fileInfo.headerVersion());
         assertEquals(36, fileInfo.saveVersion());
@@ -47,12 +47,49 @@ class SaveParserTest
     }
 
     @Test
-    void parsesSuppliedSaveCompletely() throws IOException, URISyntaxException
+    void parsesSaveVersion36Completely() throws IOException, URISyntaxException
     {
-        ParsedSave save = this.saveParser.readFullSaveFile(this.fixturePath());
+        ParsedSave save = this.saveParser.readFullSaveFile(this.fixturePath(36));
 
         assertNotNull(save.fileInfo());
         assertEquals(59, save.levels().size());
+        assertFalse(save.levels().getLast().objects().isEmpty());
+    }
+
+    @Test
+    void readsSaveVersion60Header() throws IOException, URISyntaxException
+    {
+        SaveFileInfo fileInfo = this.saveParser.readSaveFileInfo(this.fixturePath(60));
+
+        assertEquals(60, fileInfo.saveVersion());
+    }
+
+    @Test
+    void parsesSaveVersion60Completely() throws IOException, URISyntaxException
+    {
+        ParsedSave save = this.saveParser.readFullSaveFile(this.fixturePath(60));
+
+        assertNotNull(save.fileInfo());
+        assertFalse(save.levels().isEmpty());
+        assertFalse(save.levels().getLast().objects().isEmpty());
+    }
+
+    @Test
+    void readsModdedSaveHeader() throws IOException, URISyntaxException
+    {
+        SaveFileInfo fileInfo = this.saveParser.readSaveFileInfo(this.fixturePath("test-big-mods"));
+
+        assertTrue(fileInfo.modded());
+        assertFalse(fileInfo.modMetadata().isEmpty());
+    }
+
+    @Test
+    void parsesModdedSaveCompletely() throws IOException, URISyntaxException
+    {
+        ParsedSave save = this.saveParser.readFullSaveFile(this.fixturePath("test-big-mods"));
+
+        assertNotNull(save.fileInfo());
+        assertFalse(save.levels().isEmpty());
         assertFalse(save.levels().getLast().objects().isEmpty());
     }
 
@@ -69,9 +106,14 @@ class SaveParserTest
         assertEquals("Unsupported save header version 9 at byte offset 4", exception.getMessage());
     }
 
-    private Path fixturePath() throws URISyntaxException
+    private Path fixturePath(int saveVersion) throws URISyntaxException
     {
-        return Path.of(getClass().getResource("/data/test.sav").toURI());
+        return this.fixturePath("test-" + saveVersion);
+    }
+
+    private Path fixturePath(String name) throws URISyntaxException
+    {
+        return Path.of(getClass().getResource("/data/" + name + ".sav").toURI());
     }
 
     @Configuration
